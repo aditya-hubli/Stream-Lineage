@@ -1,0 +1,220 @@
+version: '3.8'
+
+services:
+  # RedPanda - Kafka-compatible streaming platform
+  redpanda:
+    image: redpandadata/redpanda:latest
+    container_name: streamlineage-redpanda
+    command:
+      - redpanda
+      - start
+      - --overprovisioned
+      - --smp
+      - "1"
+      - --memory
+      - 512M
+      - --reserve-memory
+      - 0M
+      - --node-id
+      - "0"
+      - --check=false
+      - --kafka-addr
+      - internal://0.0.0.0:9092,external://0.0.0.0:19092
+      - --advertise-kafka-addr
+      - internal://redpanda:9092,external://localhost:19092
+      - --pandaproxy-addr
+      - internal://0.0.0.0:8082,external://0.0.0.0:18082
+      - --advertise-pandaproxy-addr
+      - internal://redpanda:8082,external://localhost:18082
+      - --schema-registry-addr
+      - internal://0.0.0.0:8081,external://0.0.0.0:18081
+      - --rpc-addr
+      - redpanda:33145
+      - --advertise-rpc-addr
+      - redpanda:33145
+    ports:
+      - "19092:19092"
+      - "18081:18081"
+      - "18082:18082"
+      - "9644:9644"
+    volumes:
+      - redpanda-data:/var/lib/redpanda/data
+    networks:
+      - streamlineage-net
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health | grep -E 'Healthy:.+true' || exit 1"]
+      interval: 15s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+
+  # RedPanda Console - Web UI for Kafka
+  redpanda-console:
+    image: redpandadata/console:latest
+    container_name: streamlineage-console
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    environment:
+      CONFIG_FILEPATH: /etc/redpanda/console-config.yaml
+      KAFKA_BROKERS: redpanda:9092
+    volumes:
+      - ./infra/redpanda-console-config.yaml:/etc/redpanda/console-config.yaml:ro
+    networks:
+      - streamlineage-net
+
+  # Apache Flink - Stream processing (JobManager)
+  flink-jobmanager:
+    image: flink:1.18-python3
+    container_name: streamlineage-flink-jobmanager
+    command: jobmanager
+    ports:
+      - "8082:8081"
+    environment:
+      - JOB_MANAGER_RPC_ADDRESS=flink-jobmanager
+    networks:
+      - streamlineage-net
+
+  # Apache Flink - Stream processing (TaskManager)
+  flink-taskmanager:
+    image: flink:1.18-python3
+    command: taskmanager
+    depends_on:
+      - flink-jobmanager
+    environment:
+      - JOB_MANAGER_RPC_ADDRESS=flink-jobmanager
+      - TASK_MANAGER_NUMBER_OF_TASK_SLOTS=4
+    networks:
+      - streamlineage-net
+    deploy:
+      replicas: 2
+
+  # Lineage Ingester - Consumes events and builds DAG
+  lineage-ingester:
+    build:
+      context: .
+      dockerfile: services/lineage-ingester/Dockerfile
+    container_name: streamlineage-ingester
+    depends_on:
+      redpanda:
+        condition: service_healthy
+      flink-jobmanager:
+        condition: service_started
+    environment:
+      - KAFKA_BROKERS=redpanda:9092
+      - DUCKDB_PATH=/data/lineage.duckdb
+      - SNAPSHOT_INTERVAL=60
+    volumes:
+      - lineage-data:/data
+    networks:
+      - streamlineage-net
+    restart: unless-stopped
+
+  # FastAPI Backend - REST API and WebSocket server
+  api:
+    build:
+      context: .
+      dockerfile: services/api/Dockerfile
+    container_name: streamlineage-api
+    depends_on:
+      - lineage-ingester
+    ports:
+      - "8000:8000"
+    environment:
+      - KAFKA_BROKERS=redpanda:9092
+      - DUCKDB_PATH=/data/lineage.duckdb
+    volumes:
+      - lineage-data:/data
+    networks:
+      - streamlineage-net
+    restart: unless-stopped
+
+  # Redis - Caching layer for API
+  redis:
+    image: redis:7-alpine
+    container_name: streamlineage-redis
+    ports:
+      - "6379:6379"
+    networks:
+      - streamlineage-net
+    restart: unless-stopped
+
+  # Event Simulator - Generates test payment events
+  simulator:
+    build:
+      context: .
+      dockerfile: services/simulator/Dockerfile
+    container_name: streamlineage-simulator
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    environment:
+      - KAFKA_BROKERS=redpanda:9092
+      - PRODUCE_RATE=10
+    networks:
+      - streamlineage-net
+    restart: unless-stopped
+
+  # Prometheus - Metrics collection
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: streamlineage-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./infra/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    networks:
+      - streamlineage-net
+    restart: unless-stopped
+
+  # Grafana - Metrics visualization
+  grafana:
+    image: grafana/grafana:latest
+    container_name: streamlineage-grafana
+    depends_on:
+      - prometheus
+    ports:
+      - "3001:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - ./infra/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - ./infra/grafana/provisioning/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ./infra/grafana/provisioning/datasources:/etc/grafana/provisioning/datasources:ro
+      - grafana-data:/var/lib/grafana
+    networks:
+      - streamlineage-net
+    restart: unless-stopped
+
+  # Sidecar proxy — optional, inject lineage into non-instrumented topics
+  # Usage: docker-compose --profile sidecar up
+  sidecar:
+    build:
+      context: .
+      dockerfile: services/sidecar/Dockerfile
+    container_name: streamlineage-sidecar
+    profiles:
+      - sidecar
+    depends_on:
+      - redpanda
+    environment:
+      - SOURCE_TOPIC=${SIDECAR_SOURCE_TOPIC:-raw.events}
+      - SHADOW_TOPIC=${SIDECAR_SHADOW_TOPIC:-raw.events.lineage}
+      - KAFKA_BROKERS=redpanda:9092
+      - PRODUCER_ID=${SIDECAR_PRODUCER_ID:-sidecar-proxy}
+      - SCHEMA_ID=${SIDECAR_SCHEMA_ID:-unknown.v1}
+    networks:
+      - streamlineage-net
+    restart: unless-stopped
+
+networks:
+  streamlineage-net:
+    driver: bridge
+
+volumes:
+  redpanda-data:
+  lineage-data:
+  grafana-data:

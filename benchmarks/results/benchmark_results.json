@@ -1,0 +1,86 @@
+{
+  "_meta": {
+    "generated_at": "2026-03-24T14:45:33.586669+00:00",
+    "platform": "Windows 11 / Python 3.x / DuckDB (file-based)",
+    "note": "DuckDB write throughput is lower on Windows due to fsync. Linux/Docker performance is significantly higher."
+  },
+  "envelope_operations": {
+    "create_root_envelope": {
+      "ops_per_sec": 59428,
+      "p50_us": 13.5,
+      "p99_us": 50.4,
+      "target": "<2000us",
+      "pass": true
+    },
+    "create_child_envelope_1p": {
+      "ops_per_sec": 57463,
+      "p50_us": 14.3,
+      "p99_us": 54.5,
+      "target": "<2000us",
+      "pass": true
+    },
+    "envelope_to_headers": {
+      "ops_per_sec": 96742,
+      "p50_us": 7.2,
+      "p99_us": 23.6,
+      "target": "<2000us",
+      "pass": true
+    },
+    "headers_to_envelope": {
+      "ops_per_sec": 74553,
+      "p50_us": 9.7,
+      "p99_us": 31.7,
+      "target": "<2000us",
+      "pass": true
+    },
+    "verify_chain_hash_root": {
+      "ops_per_sec": 137282,
+      "p50_us": 6.5,
+      "p99_us": 10.1,
+      "target": "<100000us",
+      "pass": true
+    }
+  },
+  "storage_operations": {
+    "single_row_insert_p50_ms": 23.95,
+    "batch_insert_10k_total_s": 239.5,
+    "batch_insert_rate_events_per_s": 42,
+    "note": "Windows fsync overhead. Use batch inserts + WAL mode in production."
+  },
+  "query_performance": {
+    "full_scan_10k_avg_ms": 92.9,
+    "filter_by_producer_10k_avg_ms": 38.0,
+    "filter_by_schema_10k_avg_ms": 95.9,
+    "time_range_filter_avg_ms": 3.6,
+    "count_query_10k_ms": 0.8,
+    "count_query_50M_extrapolated_ms": 4205,
+    "target_50M_under_5s": true,
+    "pass": true
+  },
+  "design_doc_targets": {
+    "envelope_overhead_lt_2ms": {
+      "result": "~14us p50",
+      "pass": true
+    },
+    "chain_hash_verify_lt_100ms": {
+      "result": "~6.5us p50",
+      "pass": true
+    },
+    "dag_update_lt_500ms": {
+      "result": "not measured (requires live Kafka)",
+      "pass": null
+    },
+    "impact_analysis_lt_3s": {
+      "result": "not measured (requires live Kafka)",
+      "pass": null
+    },
+    "duckdb_50M_lt_5s": {
+      "result": "~4.2s extrapolated",
+      "pass": true
+    },
+    "kafka_header_lt_500bytes": {
+      "result": "not measured",
+      "pass": null
+    }
+  }
+}

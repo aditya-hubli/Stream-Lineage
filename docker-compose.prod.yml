@@ -1,0 +1,287 @@
+version: '3.8'
+
+# Production-optimized Docker Compose
+#
+# Differences from docker-compose.yml:
+#   - Named volumes only (no bind-mount source code)
+#   - Resource limits (mem_limit, cpus) on all services
+#   - restart: always on all services
+#   - No debug/admin ports exposed (Flink UI, RedPanda Console hidden)
+#   - Healthchecks on all critical services
+#   - Simulator and sidecar as optional profiles
+#   - Grafana admin password via env var (set GF_ADMIN_PASSWORD in .env)
+#
+# Usage:
+#   docker-compose -f docker-compose.prod.yml up -d
+#   docker-compose -f docker-compose.prod.yml --profile simulator up -d
+#   docker-compose -f docker-compose.prod.yml --profile sidecar up -d
+
+services:
+  # ---------------------------------------------------------------------------
+  # Message Broker
+  # ---------------------------------------------------------------------------
+  redpanda:
+    image: redpandadata/redpanda:latest
+    container_name: streamlineage-redpanda
+    command:
+      - redpanda
+      - start
+      - --overprovisioned
+      - --smp
+      - "2"
+      - --memory
+      - 1G
+      - --reserve-memory
+      - 0M
+      - --node-id
+      - "0"
+      - --check=false
+      - --kafka-addr
+      - internal://0.0.0.0:9092,external://0.0.0.0:19092
+      - --advertise-kafka-addr
+      - internal://redpanda:9092,external://${EXTERNAL_HOST:-localhost}:19092
+      - --pandaproxy-addr
+      - internal://0.0.0.0:8082
+      - --advertise-pandaproxy-addr
+      - internal://redpanda:8082
+      - --schema-registry-addr
+      - internal://0.0.0.0:8081
+      - --rpc-addr
+      - redpanda:33145
+      - --advertise-rpc-addr
+      - redpanda:33145
+    volumes:
+      - redpanda-data:/var/lib/redpanda/data
+    networks:
+      - streamlineage-net
+    mem_limit: 1.5g
+    cpus: "1.0"
+    restart: always
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health | grep -E 'Healthy:.+true' || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # ---------------------------------------------------------------------------
+  # Apache Flink
+  # ---------------------------------------------------------------------------
+  flink-jobmanager:
+    image: flink:1.18-python3
+    container_name: streamlineage-flink-jobmanager
+    command: jobmanager
+    # Flink UI not exposed externally in prod
+    environment:
+      - JOB_MANAGER_RPC_ADDRESS=flink-jobmanager
+    networks:
+      - streamlineage-net
+    mem_limit: 512m
+    cpus: "0.5"
+    restart: always
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8081/overview || exit 1"]
+      interval: 20s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  flink-taskmanager:
+    image: flink:1.18-python3
+    command: taskmanager
+    depends_on:
+      flink-jobmanager:
+        condition: service_healthy
+    environment:
+      - JOB_MANAGER_RPC_ADDRESS=flink-jobmanager
+      - TASK_MANAGER_NUMBER_OF_TASK_SLOTS=4
+    networks:
+      - streamlineage-net
+    mem_limit: 1g
+    cpus: "1.0"
+    restart: always
+    deploy:
+      replicas: 2
+
+  # ---------------------------------------------------------------------------
+  # Redis
+  # ---------------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    container_name: streamlineage-redis
+    command: redis-server --maxmemory 256mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis-data:/data
+    networks:
+      - streamlineage-net
+    mem_limit: 300m
+    cpus: "0.25"
+    restart: always
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  # ---------------------------------------------------------------------------
+  # Lineage Ingester
+  # ---------------------------------------------------------------------------
+  lineage-ingester:
+    build:
+      context: .
+      dockerfile: services/lineage-ingester/Dockerfile
+    container_name: streamlineage-ingester
+    depends_on:
+      redpanda:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      - KAFKA_BROKERS=redpanda:9092
+      - DUCKDB_PATH=/data/lineage.duckdb
+      - REDIS_URL=redis://redis:6379/0
+      - GRAPH_TTL_SECONDS=${GRAPH_TTL_SECONDS:-3600}
+      - SNAPSHOT_INTERVAL=60
+    volumes:
+      - lineage-data:/data
+    networks:
+      - streamlineage-net
+    mem_limit: 1g
+    cpus: "1.0"
+    restart: always
+    healthcheck:
+      test: ["CMD-SHELL", "python -c 'import duckdb; duckdb.connect(\"/data/lineage.duckdb\")' || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  # ---------------------------------------------------------------------------
+  # FastAPI
+  # ---------------------------------------------------------------------------
+  api:
+    build:
+      context: .
+      dockerfile: services/api/Dockerfile
+    container_name: streamlineage-api
+    depends_on:
+      lineage-ingester:
+        condition: service_healthy
+    ports:
+      - "${API_PORT:-8000}:8000"
+    environment:
+      - KAFKA_BROKERS=redpanda:9092
+      - DUCKDB_PATH=/data/lineage.duckdb
+      - REDIS_URL=redis://redis:6379/0
+      - API_WORKERS=${API_WORKERS:-2}
+      - PRODUCER_ACTIVE_SECONDS=${PRODUCER_ACTIVE_SECONDS:-60}
+      - PRODUCER_STALE_SECONDS=${PRODUCER_STALE_SECONDS:-300}
+    volumes:
+      - lineage-data:/data
+    networks:
+      - streamlineage-net
+    mem_limit: 512m
+    cpus: "0.5"
+    restart: always
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8000/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # ---------------------------------------------------------------------------
+  # Prometheus + Grafana
+  # ---------------------------------------------------------------------------
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: streamlineage-prometheus
+    # Not exposed externally — access via Grafana
+    volumes:
+      - ./infra/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    networks:
+      - streamlineage-net
+    mem_limit: 256m
+    cpus: "0.25"
+    restart: always
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: streamlineage-grafana
+    depends_on:
+      - prometheus
+    ports:
+      - "${GRAFANA_PORT:-3001}:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=${GF_ADMIN_PASSWORD:?GF_ADMIN_PASSWORD must be set}
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_SERVER_ROOT_URL=${GRAFANA_ROOT_URL:-http://localhost:3001}
+    volumes:
+      - ./infra/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - ./infra/grafana/provisioning/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ./infra/grafana/provisioning/datasources:/etc/grafana/provisioning/datasources:ro
+      - grafana-data:/var/lib/grafana
+    networks:
+      - streamlineage-net
+    mem_limit: 256m
+    cpus: "0.25"
+    restart: always
+
+  # ---------------------------------------------------------------------------
+  # Optional: Simulator (profile: simulator)
+  # ---------------------------------------------------------------------------
+  simulator:
+    build:
+      context: .
+      dockerfile: services/simulator/Dockerfile
+    container_name: streamlineage-simulator
+    profiles:
+      - simulator
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    environment:
+      - KAFKA_BROKERS=redpanda:9092
+      - PRODUCE_RATE=${SIMULATOR_RATE:-5}
+    networks:
+      - streamlineage-net
+    mem_limit: 128m
+    cpus: "0.25"
+    restart: always
+
+  # ---------------------------------------------------------------------------
+  # Optional: Sidecar proxy (profile: sidecar)
+  # ---------------------------------------------------------------------------
+  sidecar:
+    build:
+      context: ./services/sidecar
+      dockerfile: Dockerfile
+    container_name: streamlineage-sidecar
+    profiles:
+      - sidecar
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    environment:
+      - SOURCE_TOPIC=${SIDECAR_SOURCE_TOPIC:-raw.events}
+      - SHADOW_TOPIC=${SIDECAR_SHADOW_TOPIC:-raw.events.lineage}
+      - KAFKA_BROKERS=redpanda:9092
+      - PRODUCER_ID=${SIDECAR_PRODUCER_ID:-sidecar-proxy}
+      - SCHEMA_ID=${SIDECAR_SCHEMA_ID:-unknown.v1}
+    networks:
+      - streamlineage-net
+    mem_limit: 128m
+    cpus: "0.25"
+    restart: always
+
+networks:
+  streamlineage-net:
+    driver: bridge
+
+volumes:
+  redpanda-data:
+  lineage-data:
+  redis-data:
+  prometheus-data:
+  grafana-data:

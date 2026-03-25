@@ -1,6 +1,9 @@
-# StreamLineage
+# Stream-Lineage
 
 **Real-time Kafka pipeline observability** — cryptographic provenance on every event, live DAG tracking, schema drift detection, and surgical replay by exact partition+offset pairs instead of replaying entire topics.
+
+**[Try the interactive simulator →](https://stream-lineage.vercel.app)**
+No install, no backend. Pick a pipeline topology, inject corruption, and watch the surgical replay plan generate in real time.
 
 ---
 
@@ -41,7 +44,7 @@ React Frontend (port 5173)
 - **Schema drift detection** — detects BREAKING / ADDITIVE / COMPATIBLE schema changes per producer
 - **Impact analysis** — BFS blast radius computation from any corrupted producer
 - **Chain hash verification** — cryptographic audit of any event's full lineage
-- **Interactive simulator** — runs entirely in-browser, no backend required
+- **Interactive simulator** — runs entirely in-browser at [stream-lineage.vercel.app](https://stream-lineage.vercel.app), no backend required
 - **Broker-agnostic SDK** — works via Kafka headers (confluent-kafka) or embedded JSON payload (any platform)
 
 ---
